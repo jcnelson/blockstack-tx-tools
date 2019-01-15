@@ -4,6 +4,10 @@ extern crate ini;
 extern crate jsonrpc;
 extern crate secp256k1;
 extern crate serde;
+extern crate curve25519_dalek;
+extern crate ed25519_dalek;
+extern crate sha2;
+extern crate bincode;
 
 use std::env;
 use std::process;
@@ -19,11 +23,107 @@ use bitcoin::util::privkey::{Privkey};
 
 use secp256k1::{Secp256k1, Message};
 
+use sha2::Sha512;
+
+use rand::rngs::OsRng;
+
+use ed25519_dalek::Keypair as ed25519_Keypair;
+use ed25519_dalek::SecretKey as ed25519_SecretKey;
+use ed25519_dalek::PublicKey as ed25519_PublicKey;
+
+use curve25519_dalek::edwards::CompressedEdwardsY;
+
+// Borrowed from Andrew Poelstra's rust-bitcoin library
+/// An iterator that returns pairs of elements
+pub struct Pair<I>
+    where I: Iterator
+{
+    iter: I,
+    last_elem: Option<I::Item>
+}
+
+impl<I: Iterator> Iterator for Pair<I> {
+    type Item = (I::Item, I::Item);
+
+    #[inline]
+    fn next(&mut self) -> Option<(I::Item, I::Item)> {
+        let elem1 = self.iter.next();
+        if elem1.is_none() {
+            None
+        } else {
+            let elem2 = self.iter.next();
+            if elem2.is_none() {
+                self.last_elem = elem1;
+                None
+            } else {
+                Some((elem1.unwrap(), elem2.unwrap()))
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self.iter.size_hint() {
+            (n, None) => (n/2, None),
+            (n, Some(m)) => (n/2, Some(m/2))
+        }
+    }
+}
+
+impl<I: Iterator> Pair<I> {
+    /// Returns the last element of the iterator if there were an odd
+    /// number of elements remaining before it was Pair-ified.
+    #[inline]
+    pub fn remainder(self) -> Option<I::Item> {
+        self.last_elem
+    }
+}
+
+/// Returns an iterator that returns elements of the original iterator 2 at a time
+pub trait Pairable : Sized + Iterator {
+    /// Returns an iterator that returns elements of the original iterator 2 at a time
+    fn pair(self) -> Pair<Self>;
+}
+
+impl<I: Iterator> Pairable for I {
+    /// Creates an iterator that yields pairs of elements from the underlying
+    /// iterator, yielding `None` when there are fewer than two elements to
+    /// return.
+    #[inline]
+    fn pair(self) -> Pair<I> {
+        Pair {iter: self, last_elem: None }
+    }
+}
+
 /// Convert a slice of u8 to a hex string
 pub fn to_hex(s: &[u8]) -> String {
     let r : Vec<String> = s.to_vec().iter().map(|b| format!("{:02x}", b)).collect();
     return r.join("");
 }
+
+// borrowed from Andrew Poelstra's rust-bitcoin library
+/// Convert a hexadecimal-encoded string to its corresponding bytes
+pub fn from_hex(s: &str) -> Result<Vec<u8>, &'static str> {
+    let mut v = vec![];
+    let mut iter = s.chars().pair();
+    // Do the parsing
+    iter.by_ref().fold(Ok(()), |e, (f, s)| 
+        if e.is_err() { e }
+        else {
+            match (f.to_digit(16), s.to_digit(16)) {
+                (None, _) => Err("unexpected hex digit"),
+                (_, None) => Err("unexpected hex digit"),
+                (Some(f), Some(s)) => { v.push((f * 0x10 + s) as u8); Ok(()) }
+            }
+        }
+    )?;
+    // Check that there was no remainder
+    match iter.remainder() {
+        Some(_) => Err("hexstring of odd length"),
+        None => Ok(v)
+    }
+}
+
 
 pub fn main() {
     let argv : Vec<String> = env::args().collect();
@@ -33,6 +133,42 @@ pub fn main() {
     }
 
     match argv[1].as_str() {
+        "eddsa-privkey" => {
+            let mut csprng: OsRng = OsRng::new().unwrap();
+            let keypair: ed25519_Keypair = ed25519_Keypair::generate::<Sha512, _>(&mut csprng);
+
+            let privkey_hex = to_hex(&keypair.secret.to_bytes());
+            println!("{}", &privkey_hex);
+        },
+        "eddsa-pubkey" => {
+            if argv.len() < 3 {
+                eprintln!("Usage: {} eddsa-pubkey EDDSA_PRIVATE_KEY", argv[0]);
+                process::exit(1);
+            }
+
+            let secret_bytes = from_hex(&argv[2]).unwrap();
+            let secret_key = ed25519_SecretKey::from_bytes(&secret_bytes).unwrap();
+            let pubkey = ed25519_PublicKey::from_secret::<Sha512>(&secret_key);
+
+            let pubkey_hex = to_hex(&pubkey.to_bytes());
+            println!("{}", &pubkey_hex);
+        },
+        "eddsa-pubkey-check" => {
+            if argv.len() < 3 {
+                eprintln!("Usage: {} eddsa-pubkey-check EDDSA_PUBLIC_KEY", argv[0]);
+                process::exit(1);
+            }
+
+            let pubkey_bytes = from_hex(&argv[2]).unwrap();
+            let mut pubkey_slice = [0; 32];
+            assert!(pubkey_bytes.len() == 32);
+            pubkey_slice.copy_from_slice(&pubkey_bytes[..]);
+
+            let compressed_pubkey = CompressedEdwardsY(pubkey_slice);
+            let _pubkey = compressed_pubkey.decompress().unwrap();
+            
+            // if we get here, then it's valid
+        },
         "decode-tx" => {
             if argv.len() < 3 {
                 eprintln!("Usage: {} decode-tx RAW_TRANSACTION", argv[0]);
